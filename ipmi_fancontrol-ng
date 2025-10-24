@@ -37,13 +37,23 @@ my $hostname            = `hostname`;
 # Remove line ending from $hostname
 $hostname =~ s/\n//g;
 
-my $number_of_cpus      = 2; # Number of CPUs to search for
-#my $number_of_gpus      = 4; # Number of GPUs to search for
-my $number_of_fans      = 6; # Number of FANs to search for
-my $number_of_fanbanks  = 2; # Number of BANKs of FANs to update
-#my $number_of_fanbanks  = 2; # Number of BANKs of FANs to update
-my $min_temp_change     = 0; # *C minimum change to actually cause a fan speed update
-my $seconds_to_sleep    = 3; # Number of seconds to sleep between update loops
+my $number_of_cpus         = 2; # Number of CPUs to search for
+#my $number_of_gpus        = 4; # Number of GPUs to search for
+my $number_of_fans         = 6; # Number of FANs to search for
+my $number_of_fanbanks     = 2; # Number of BANKs of FANs to update
+#my $number_of_fanbanks    = 2; # Number of BANKs of FANs to update
+my $min_temp_change        = 0; # *C minimum change to actually cause a fan speed update
+my $seconds_to_sleep       = 2; # Number of seconds to sleep between update loops (lower = tighter control)
+
+# Control Resilience & Diagnostics (IBM IMM2 quirks)
+my $min_duty               = 25;   # Minimum duty to request (0-255). Too low can trigger IMM2 ramp-up
+my $max_duty               = 250;  # Maximum duty to request (0-255)
+my $refresh_period_secs    = 8;    # Reassert fan command at least this often even if temps haven't changed
+my $enable_diagnostics     = 1;    # Print periodic diagnostics (SEL, SDR, RPMs)
+my $diagnostics_every_loops= 10;   # Emit diagnostics every N control loops
+my $override_rpm_threshold = 8000; # If RPM exceeds this while asking for a low duty, assume IMM2 override
+my $override_duty_threshold= 80;   # If desired duty is below this and RPM is very high, treat as override
+my $rpm_deviation_threshold= 2000; # If RPM jumps by this much unexpectedly, flag
 
 # IPMI Configuration
 #my $ipmi_username       = "username_goes_here";
@@ -74,11 +84,24 @@ my $g_current_gpu_temp = 0;
 my $g_current_cpu_temp = 0;
 my $g_last_set_cpu_temp = 0;
 my $g_last_set_gpu_temp = 0;
+my $g_last_set_time_epoch = 0;      # Last time we issued a fan command
+my $g_loops_since_diag = 0;         # Diagnostic cadence counter
+my $g_last_max_rpm = 0;             # Last observed max RPM (for deviation detection)
+
+sub ClampFanSpeed
+{
+    my ( $s ) = @_;
+    $s = max($min_duty, $s);
+    $s = max(0, $s);        # guard
+    $s = min($max_duty, $s);
+    return $s;
+}
 
 sub Internal_DoSetFanSpeed
 {
     my ( $fan_speed ) = @_;
 
+    $fan_speed = ClampFanSpeed($fan_speed);
     # Sets the speed for each individual fan
     for (my $i = 1; $i <= $number_of_fanbanks; $i++)
     {
@@ -94,7 +117,12 @@ sub SetFanSpeed
 
     my $cpu_temp_difference = $g_current_cpu_temp - $g_last_set_cpu_temp;
     my $gpu_temp_difference = $g_current_gpu_temp - $g_last_set_gpu_temp;
-    if( ( (abs $cpu_temp_difference) > $min_temp_change ) or ( (abs $gpu_temp_difference) > $min_temp_change ) )
+    my $now = time();
+    my $time_since_last = $now - $g_last_set_time_epoch;
+
+    my $should_refresh = ($refresh_period_secs > 0) && ($time_since_last >= $refresh_period_secs);
+
+    if( $should_refresh or ( ( (abs $cpu_temp_difference) > $min_temp_change ) or ( (abs $gpu_temp_difference) > $min_temp_change ) ) )
     {
         # Set all 4 fan banks to operate at $fan_speed duty cycle (0x0-0x64 valid range)
         print "\n";
@@ -103,11 +131,13 @@ sub SetFanSpeed
         print "We last updated fan speed $gpu_temp_difference *C ago (GPU Temperature).\n";
         print "Current CPU Temperature is $g_current_cpu_temp *C.\n";
         print "Current GPU Temperature is $g_current_gpu_temp *C.\n";
+        if ($should_refresh) { print "Reason: periodic refresh (" . $time_since_last . "s since last).\n"; }
         print "*****************************************************************\n";
 
         $g_last_set_cpu_temp = $g_current_cpu_temp;
         $g_last_set_gpu_temp = $g_current_gpu_temp;
         $g_current_fan_duty_cycle = $fan_speed;
+        $g_last_set_time_epoch = $now;
 
         Internal_DoSetFanSpeed( $fan_speed );
     }
@@ -131,6 +161,72 @@ sub GetCPUTemp
     $current_cpu_temp =~ s/\n//g;
 
     return $current_cpu_temp;
+}
+
+sub GetFanRPMStats
+{
+    # Returns (max_rpm, avg_rpm, count, \@rpms)
+    my @rpms = ();
+    my $sdr = `$ipmi_preamble sdr type Fan 2>/dev/null`;
+    my @lines = split("\n", $sdr);
+    foreach my $line (@lines) {
+        # Example formats can vary, try to capture numeric RPM
+        if ($line =~ /([0-9]{2,})\s*RPM/i) {
+            push @rpms, $1 + 0;
+        }
+    }
+    my $count = scalar @rpms;
+    if ($count == 0) { return (0, 0, 0, \@rpms); }
+    my $max_rpm = 0; my $sum = 0;
+    foreach my $r (@rpms) { $max_rpm = $r if $r > $max_rpm; $sum += $r; }
+    my $avg = sprintf('%.0f', $sum / $count);
+    return ($max_rpm, $avg, $count, \@rpms);
+}
+
+sub MaybeEmitDiagnostics
+{
+    return if (!$enable_diagnostics);
+    $g_loops_since_diag++;
+    if ($g_loops_since_diag < $diagnostics_every_loops) { return; }
+    $g_loops_since_diag = 0;
+
+    print "\n----- Diagnostics -----\n";
+    my ($maxrpm, $avgrpm, $count, $rpms_ref) = GetFanRPMStats();
+    print "Fan tach count=$count, maxRPM=$maxrpm, avgRPM=$avgrpm\n";
+    if ($count > 0) {
+        my $rpmlist = join(',', @$rpms_ref);
+        print "RPMs: [$rpmlist]\n";
+    } else {
+        print "No fan tach data available from SDR.\n";
+    }
+    my $sdr_info = `$ipmi_preamble sdr info 2>/dev/null`;
+    print "SDR info: \n$sdr_info\n" if length($sdr_info);
+    my $sel_tail = `$ipmi_preamble sel elist 2>/dev/null | tail -n 5`;
+    print "SEL last 5 events:\n$sel_tail\n" if length($sel_tail);
+    print "-----------------------\n\n";
+}
+
+sub CheckForOverride
+{
+    my ( $desired_fan_speed ) = @_;
+    my ($maxrpm, $avgrpm, $count, $rpms_ref) = GetFanRPMStats();
+    if ($count == 0) { return; }
+
+    my $override_suspected = 0;
+    if ( ($desired_fan_speed < $override_duty_threshold) && ($maxrpm >= $override_rpm_threshold) ) {
+        $override_suspected = 1;
+    }
+    if ($g_last_max_rpm > 0 && ($maxrpm - $g_last_max_rpm) >= $rpm_deviation_threshold && $desired_fan_speed < $override_duty_threshold) {
+        $override_suspected = 1;
+    }
+    $g_last_max_rpm = $maxrpm;
+
+    if ($override_suspected) {
+        print "[WARN] IMM2 override suspected: desired duty=$desired_fan_speed, maxRPM=$maxrpm. Reasserting command.\n";
+        # Immediately reassert once to try to reclaim control
+        Internal_DoSetFanSpeed( $desired_fan_speed );
+        $g_last_set_time_epoch = time();
+    }
 }
 
 sub CalculateScalars
@@ -185,6 +281,12 @@ sub UpdateFanSpeed
     close(FH);
     
     SetFanSpeed($desired_fan_speed);
+
+    # Attempt to detect and mitigate controller overrides
+    CheckForOverride($desired_fan_speed);
+
+    # Periodic diagnostics for troubleshooting
+    MaybeEmitDiagnostics();
 }
 
 print "Starting.\n";
